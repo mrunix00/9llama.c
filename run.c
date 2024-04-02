@@ -1,21 +1,16 @@
 /* Inference for Llama-2 Transformer model in pure C */
-
+#define _POSIX_SOURCE
 #include <stdio.h>
 #include <stdlib.h>
 #include <ctype.h>
-#include <time.h>
 #include <math.h>
 #include <string.h>
+#include <time.h>
 #include <fcntl.h>
-#if defined _WIN32
-    #include "win.h"
-#else
-    #include <unistd.h>
-    #include <sys/mman.h>
-#endif
+#include <unistd.h>
+#include <stdint.h>
 // ----------------------------------------------------------------------------
 // Transformer model
-
 typedef struct {
     int dim; // transformer dimension
     int hidden_dim; // for ffn layers
@@ -155,8 +150,12 @@ void read_checkpoint(char* checkpoint, Config* config, TransformerWeights* weigh
     // memory map the Transformer weights into the data pointer
     *fd = open(checkpoint, O_RDONLY); // open in read only mode
     if (*fd == -1) { fprintf(stderr, "open failed!\n"); exit(EXIT_FAILURE); }
-    *data = mmap(NULL, *file_size, PROT_READ, MAP_PRIVATE, *fd, 0);
-    if (*data == MAP_FAILED) { fprintf(stderr, "mmap failed!\n"); exit(EXIT_FAILURE); }
+    *data = malloc(*file_size);
+    size_t r = read(*fd, *data, *file_size);
+    if (r == -1) {
+        fprintf(stderr, "read failed!\n");
+        exit(EXIT_FAILURE);
+    }
     float* weights_ptr = *data + sizeof(Config)/sizeof(float);
     memory_map_weights(weights, config, weights_ptr, shared_weights);
 }
@@ -169,10 +168,8 @@ void build_transformer(Transformer *t, char* checkpoint_path) {
 }
 
 void free_transformer(Transformer* t) {
-    // close the memory mapping
-    if (t->data != MAP_FAILED) { munmap(t->data, t->file_size); }
+    if (t->data != NULL) free(t->data);
     if (t->fd != -1) { close(t->fd); }
-    // free the RunState buffers
     free_run_state(&t->state);
 }
 
@@ -187,7 +184,7 @@ void rmsnorm(float* o, float* x, float* weight, int size) {
     }
     ss /= size;
     ss += 1e-5f;
-    ss = 1.0f / sqrtf(ss);
+    ss = 1.0f / sqrt(ss);
     // normalize and scale
     for (int j = 0; j < size; j++) {
         o[j] = weight[j] * (ss * x[j]);
@@ -205,7 +202,7 @@ void softmax(float* x, int size) {
     // exp and sum
     float sum = 0.0f;
     for (int i = 0; i < size; i++) {
-        x[i] = expf(x[i] - max_val);
+        x[i] = exp(x[i] - max_val);
         sum += x[i];
     }
     // normalize
@@ -264,10 +261,10 @@ float* forward(Transformer* transformer, int token, int pos) {
         // RoPE relative positional encoding: complex-valued rotate q and k in each head
         for (int i = 0; i < dim; i+=2) {
             int head_dim = i % head_size;
-            float freq = 1.0f / powf(10000.0f, head_dim / (float)head_size);
+            float freq = 1.0f / pow(10000.0f, head_dim / (float)head_size);
             float val = pos * freq;
-            float fcr = cosf(val);
-            float fci = sinf(val);
+            float fcr = cos(val);
+            float fci = sin(val);
             int rotn = i < kv_dim ? 2 : 1; // how many vectors? 2 = q & k, 1 = q only
             for (int v = 0; v < rotn; v++) {
                 float* vec = v == 0 ? s->q : s->k; // the vector to rotate (query or key)
@@ -295,7 +292,7 @@ float* forward(Transformer* transformer, int token, int pos) {
                 for (int i = 0; i < head_size; i++) {
                     score += q[i] * k[i];
                 }
-                score /= sqrtf(head_size);
+                score /= sqrt(head_size);
                 // save the score to the attention buffer
                 att[t] = score;
             }
@@ -338,7 +335,7 @@ float* forward(Transformer* transformer, int token, int pos) {
         for (int i = 0; i < hidden_dim; i++) {
             float val = s->hb[i];
             // silu(x)=x*σ(x), where σ(x) is the logistic sigmoid
-            val *= (1.0f / (1.0f + expf(-val)));
+            val *= (1.0f / (1.0f + exp(-val)));
             // elementwise multiply with w3(x)
             val *= s->hb2[i];
             s->hb[i] = val;
@@ -712,17 +709,6 @@ int sample(Sampler* sampler, float* logits) {
     }
     return next;
 }
-
-// ----------------------------------------------------------------------------
-// utilities: time
-
-long time_in_ms() {
-    // return time in milliseconds, for benchmarking the model speed
-    struct timespec time;
-    clock_gettime(CLOCK_REALTIME, &time);
-    return time.tv_sec * 1000 + time.tv_nsec / 1000000;
-}
-
 // ----------------------------------------------------------------------------
 // generation loop
 
@@ -745,7 +731,6 @@ void generate(Transformer *transformer, Tokenizer *tokenizer, Sampler *sampler, 
     int token = prompt_tokens[0]; // kick off with the first token in the prompt
     int pos = 0;     // position in the sequence
     while (pos < steps) {
-
         // forward the transformer to get logits for the next token
         float* logits = forward(transformer, token, pos);
 
@@ -767,18 +752,8 @@ void generate(Transformer *transformer, Tokenizer *tokenizer, Sampler *sampler, 
         safe_printf(piece); // same as printf("%s", piece), but skips "unsafe" bytes
         fflush(stdout);
         token = next;
-
-        // init the timer here because the first iteration can be slower
-        if (start == 0) { start = time_in_ms(); }
     }
     printf("\n");
-
-    // report achieved tok/s (pos-1 because the timer starts after first iteration)
-    if (pos > 1) {
-        long end = time_in_ms();
-        fprintf(stderr, "achieved tok/s: %f\n", (pos-1) / (double)(end-start)*1000);
-    }
-
     free(prompt_tokens);
 }
 
@@ -888,7 +863,7 @@ void chat(Transformer *transformer, Tokenizer *tokenizer, Sampler *sampler,
 // CLI, include only if not testing
 #ifndef TESTING
 
-void error_usage() {
+void error_usage(void) {
     fprintf(stderr, "Usage:   run <checkpoint> [options]\n");
     fprintf(stderr, "Example: run model.bin -n 256 -i \"Once upon a time\"\n");
     fprintf(stderr, "Options:\n");
